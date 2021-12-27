@@ -13,7 +13,7 @@ type Query struct {
 	RestApi *RestKsql
 
 	queryId string
-	schema  string
+	schema  map[string]KsqlField
 }
 
 func NewQuery(restApi *RestKsql) *Query {
@@ -38,9 +38,9 @@ func (qry *Query) LoadTable(table string, kindPtr interface{}, targetSlice inter
 	}
 
 	queryString := fmt.Sprintf("SELECT %s FROM %s;", names, table)
-	result, err := qry.RestApi.RunQuery(queryString)
+	result, err := qry.RestApi.RunQuery(queryString, "query")
 	if err != nil {
-		err = errors.Wrap(err, "failed to run query")
+		err = errors.Wrapf(err, "failed to run querym, ksql response error: %s", result.Error())
 		return
 	}
 	if result.Error() != nil {
@@ -48,7 +48,20 @@ func (qry *Query) LoadTable(table string, kindPtr interface{}, targetSlice inter
 		return
 	}
 
-	err = fillResultIntoSlice(result, targetSlice)
+	header, rows := result.Get()
+	qry.queryId = header.QueryId
+	qry.schema, err = header.Schema()
+	if err != nil {
+		err = errors.Wrap(err, "failed to get schema fields")
+		return
+	}
+	_, err = qry.verifySchema(kindPtr)
+	if err != nil {
+		err = errors.Wrap(err, "verification of schema fields failed")
+		return
+	}
+
+	err = fillResultIntoSlice(rows, targetSlice)
 	if err != nil {
 		err = errors.Wrap(err, "couldnt fill result into slice")
 		return
@@ -56,17 +69,84 @@ func (qry *Query) LoadTable(table string, kindPtr interface{}, targetSlice inter
 	return
 }
 
-func getQueryPartial(modelPtr interface{}) (names string, types string, err error) {
-	val := reflect.ValueOf(modelPtr)
-
-	if val.Kind() != reflect.Ptr {
-		err = errors.Errorf("getQueryPartial received non pointer type (got %s)", val.Kind())
+func (qry *Query) InsertRow(stream string, row interface{}) (err error) {
+	if qry.RestApi == nil {
+		err = errors.Errorf("ksql rest api not conifgured")
+		return
+	}
+	if !qry.RestApi.IsReady() {
+		err = errors.Errorf("ksql rest api not ready")
 		return
 	}
 
-	structType := val.Type().Elem()
-	if structType.Kind() != reflect.Struct {
-		err = errors.Errorf("getQueryPartial received pointer to non-struct type (%s)", structType.Kind())
+	val := reflect.ValueOf(row)
+
+	if val.Kind() != reflect.Struct {
+		err = errors.Errorf("received non struct type (got %s)", val.Kind())
+		return
+	}
+
+	names, _, err := getQueryPartial(row)
+	if err != nil {
+		err = errors.Wrapf(err, "get query partials failed (insert into stream: %s)", stream)
+		return
+	}
+
+	// timeField := time.Time{}
+	// timeType := reflect.TypeOf(timeField)
+
+	valString := ""
+	for ix, field := range reflect.VisibleFields(val.Type()) {
+		if ix > 0 {
+			valString += ", "
+		}
+		switch field.Type.Kind() {
+		case reflect.Int, reflect.Int16, reflect.Int32, reflect.Int64:
+			valString += fmt.Sprintf("%d", val.FieldByName(field.Name).Interface())
+		case reflect.Float32, reflect.Float64:
+			valString += fmt.Sprintf("%f", val.FieldByName(field.Name).Interface())
+		case reflect.Bool:
+			valString += fmt.Sprintf("%v", val.FieldByName(field.Name).Interface())
+		case reflect.String:
+			valString += fmt.Sprintf("'%v'", val.FieldByName(field.Name).Interface())
+		default:
+			err = errors.Errorf("unsupported type %s", field.Type.Kind())
+			return
+		}
+	}
+
+	queryString := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s);", stream, names, valString)
+
+	result, err := qry.RestApi.RunQuery(queryString, "ksql")
+	if err != nil {
+		err = errors.Wrapf(err, "failed to run querym, ksql response error: %s", result.Error())
+		return
+	}
+	if result.Error() != nil {
+		err = errors.Wrap(err, "returned ksql result contains error")
+		return
+	}
+
+	return
+}
+
+func getQueryPartial(modelPtr interface{}) (names string, types string, err error) {
+	val := reflect.ValueOf(modelPtr)
+
+	var structType reflect.Type
+
+	switch val.Kind() {
+	case reflect.Ptr:
+		structType = val.Type().Elem()
+		if structType.Kind() != reflect.Struct {
+			err = errors.Errorf("getQueryPartial received pointer to non-struct type (%s)", structType.Kind())
+			return
+		}
+	case reflect.Struct:
+		structType = val.Type()
+
+	default:
+		err = errors.Errorf("getQueryPartial received non struct, nor pointer to struct type (got %s)", val.Kind())
 		return
 	}
 
@@ -131,7 +211,88 @@ func getQueryPartial(modelPtr interface{}) (names string, types string, err erro
 	return
 }
 
-func fillResultIntoSlice(result *KsqlResult, targetSlice interface{}) error {
+func (qry *Query) verifySchema(modelPtr interface{}) (fieldsOk bool, err error) {
+	val := reflect.ValueOf(modelPtr)
+
+	if val.Kind() != reflect.Ptr {
+		err = errors.Errorf("verifyFieldsInSchema received non pointer type (got %s)", val.Kind())
+		return
+	}
+
+	structType := val.Type().Elem()
+	if structType.Kind() != reflect.Struct {
+		err = errors.Errorf("verifyFieldsInSchema received pointer to non-struct type (%s)", structType.Kind())
+		return
+	}
+
+	timeField := time.Time{}
+	timeType := reflect.TypeOf(timeField)
+
+	for _, field := range reflect.VisibleFields(structType) {
+		schemaField, fieldPresent := qry.schema[strings.ToLower(field.Name)]
+		if !fieldPresent {
+			err = errors.Errorf("field %s, kind %s not present in schema fields ksql response", field.Name, field.Type.Kind())
+			return
+		}
+		switch field.Type.Kind() {
+		case reflect.Bool:
+			if strings.EqualFold(schemaField.Type, "boolean") {
+				fieldsOk = true
+			} else {
+				fieldsOk = false
+				err = errors.Errorf("field %s, kind %s mismatch type in schema (%s)", field.Name, field.Type.Kind(), schemaField.Type)
+				return
+			}
+		case reflect.String:
+			if strings.EqualFold(schemaField.Type, "string") || strings.EqualFold(schemaField.Type, "varchar") {
+				fieldsOk = true
+			} else {
+				fieldsOk = false
+				err = errors.Errorf("field %s, kind %s mismatch type in schema (%s)", field.Name, field.Type.Kind(), schemaField.Type)
+				return
+			}
+		case reflect.Int32:
+			if strings.EqualFold(schemaField.Type, "int") || strings.EqualFold(schemaField.Type, "integer") {
+				fieldsOk = true
+			} else {
+				fieldsOk = false
+				err = errors.Errorf("field %s, kind %s mismatch type in schema (%s)", field.Name, field.Type.Kind(), schemaField.Type)
+				return
+			}
+		case reflect.Int64:
+			if strings.EqualFold(schemaField.Type, "bigint") || strings.EqualFold(schemaField.Type, "long") {
+				fieldsOk = true
+			} else {
+				fieldsOk = false
+				err = errors.Errorf("field %s, kind %s mismatch type in schema (%s)", field.Name, field.Type.Kind(), schemaField.Type)
+				return
+			}
+		case reflect.Float64:
+			if strings.EqualFold(schemaField.Type, "double") {
+				fieldsOk = true
+			} else {
+				fieldsOk = false
+				err = errors.Errorf("field %s, kind %s mismatch type in schema (%s)", field.Name, field.Type.Kind(), schemaField.Type)
+				return
+			}
+		case timeType.Kind():
+			if strings.EqualFold(schemaField.Type, "timestamp") {
+				fieldsOk = true
+			} else {
+				fieldsOk = false
+				err = errors.Errorf("field %s, kind %s mismatch type in schema (%s)", field.Name, field.Type.Kind(), schemaField.Type)
+				return
+			}
+		default:
+			fieldsOk = false
+			err = errors.Errorf("unsupported field %s, kind: %s", field.Name, field.Type.Kind())
+			return
+		}
+	}
+	return
+}
+
+func fillResultIntoSlice(rows []*KsqlRow, targetSlice interface{}) error {
 	val := reflect.ValueOf(targetSlice)
 	if val.Kind() != reflect.Ptr {
 		return errors.Errorf("expected pointer to slice, got: %s", val.Kind())
@@ -148,7 +309,6 @@ func fillResultIntoSlice(result *KsqlResult, targetSlice interface{}) error {
 		return errors.Errorf("targetSlice is a pointer to slice of non structs (%s)", elemType.Kind())
 	}
 
-	_, rows := result.Get()
 	for _, row := range rows {
 		rowVal := reflect.ValueOf(row.Columns)
 		if rowVal.Type().Kind() != reflect.Slice {
@@ -168,17 +328,39 @@ func fillResultIntoSlice(result *KsqlResult, targetSlice interface{}) error {
 				return errors.Errorf("invalind row field index %d", ix)
 			}
 			if !rowField.IsNil() && !rowField.IsZero() {
+				rowFieldVal := reflect.ValueOf(rowField.Interface())
 				switch field.Type.Kind() {
 				case reflect.Bool:
-					reflect.Indirect(element).Field(ix).SetBool(rowField.Interface().(bool))
+					switch rowFieldVal.Kind() {
+					case reflect.Bool:
+						reflect.Indirect(element).Field(ix).SetBool(rowField.Interface().(bool))
+					default:
+						return errors.Errorf("unsupported conversion, rowField kind is: %s, target field kind: %s", rowFieldVal.Kind(), field.Type.Kind())
+					}
 				case reflect.String:
-					reflect.Indirect(element).Field(ix).SetString(rowField.Interface().(string))
-				case reflect.Int32:
-					reflect.Indirect(element).Field(ix).SetInt(rowField.Interface().(int64))
-				case reflect.Int64:
-					reflect.Indirect(element).Field(ix).SetInt(rowField.Interface().(int64))
+					switch rowFieldVal.Kind() {
+					case reflect.String:
+						reflect.Indirect(element).Field(ix).SetString(rowField.Interface().(string))
+					default:
+						return errors.Errorf("unsupported conversion, rowField kind is: %s, target field kind: %s", rowFieldVal.Kind(), field.Type.Kind())
+					}
+				case reflect.Int32, reflect.Int64:
+					switch rowFieldVal.Kind() {
+					case reflect.Int, reflect.Int16, reflect.Int32, reflect.Int64:
+						reflect.Indirect(element).Field(ix).SetInt(rowField.Interface().(int64))
+					case reflect.Float32, reflect.Float64:
+						reflect.Indirect(element).Field(ix).SetInt(int64(rowField.Interface().(float64)))
+					default:
+						return errors.Errorf("unsupported conversion, rowField kind is: %s, target field kind: %s", rowFieldVal.Kind(), field.Type.Kind())
+					}
+
 				case reflect.Float64:
-					reflect.Indirect(element).Field(ix).SetFloat(rowField.Interface().(float64))
+					switch rowFieldVal.Kind() {
+					case reflect.Float32, reflect.Float64:
+						reflect.Indirect(element).Field(ix).SetFloat(rowField.Interface().(float64))
+					default:
+						return errors.Errorf("unsupported conversion, rowField kind is: %s, target field kind: %s", rowFieldVal.Kind(), field.Type.Kind())
+					}
 				}
 			}
 		}

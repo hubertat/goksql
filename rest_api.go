@@ -81,8 +81,8 @@ func (rk *RestKsql) IsReady() bool {
 	return rk.info.IsRunning()
 }
 
-func (rk *RestKsql) RunQuery(queryString string) (result *KsqlResult, err error) {
-	getInfoPath, err := rk.host.Parse("/query")
+func (rk *RestKsql) RunQuery(queryString string, endpoint string) (result *KsqlResult, err error) {
+	getInfoPath, err := rk.host.Parse("/" + endpoint)
 	if err != nil {
 		err = errors.Wrapf(err, "failed to parse /query url")
 		return
@@ -120,22 +120,33 @@ func (rk *RestKsql) RunQuery(queryString string) (result *KsqlResult, err error)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != 200 {
-		respBytes, _ := io.ReadAll(resp.Body)
-		err = errors.Errorf("received http response status %d, %s\nresponse string: %s", resp.StatusCode, resp.Status, string(respBytes))
-		return
-	}
-
 	if resp.Header.Get("Content-Type") != "application/json" {
 		err = errors.Errorf("received unsupported Content-Type: %s in response", resp.Header.Get("application/json"))
 		return
 	}
 
-	decoder := json.NewDecoder(resp.Body)
+	fullResponse, err := io.ReadAll(resp.Body)
+	if err != nil {
+		err = errors.Wrap(err, "failed to readAll response body")
+		return
+	}
+
 	result = &KsqlResult{}
-	err = decoder.Decode(&result.Result)
+	err = json.Unmarshal(fullResponse, &result.Result)
 	if err != nil {
 		err = errors.Wrap(err, "json decoder (result response) failed")
+	}
+
+	if resp.StatusCode != 200 {
+		errorResult := &KsqlError{}
+		decodingErr := json.Unmarshal(fullResponse, errorResult)
+		if decodingErr == nil {
+			err = errors.Errorf("received http response status (%d):\n %v", resp.StatusCode, errorResult)
+		} else {
+			err = errors.Errorf("received http response status (%d): %s\n couldnt decode ksql message, request body: %v", resp.StatusCode, resp.Status, query)
+		}
+
+		return
 	}
 
 	return

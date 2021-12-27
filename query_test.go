@@ -2,7 +2,6 @@ package goksql_test
 
 import (
 	"goksql"
-	"log"
 	"testing"
 )
 
@@ -15,7 +14,8 @@ func TestLoadTable(t *testing.T) {
 	}
 
 	type TestRow struct {
-		// TId int32
+		TId        int32
+		IsValid    bool
 		Name       string
 		Value      float64
 		OtherValue float64
@@ -33,20 +33,31 @@ func TestLoadTable(t *testing.T) {
 		t.Errorf("0 len result")
 		return
 	}
-	for _, el := range result {
-		log.Println(el)
+
+	want := []TestRow{
+		{1, false, "longer name", 3.0, 1.1},
+		{2, false, "noname", 3.0, 22.2},
 	}
 
-	// want := []TestRow{
-	// 	{1, "longer name", 3.0, 1.1},
-	// 	{2, "noname", 3.0, 22.2},
-	// }
+	for ix, val := range result {
+		if len(want) <= ix {
+			break
+		}
+		if want[ix].TId != val.TId || want[ix].Value != val.Value {
+			t.Errorf("row mismatch! (showing rows) want:\n%v\ngot:\n%v\n", want[ix], val)
+			return
+		}
+	}
 
-	// for ix, val := range rows {
-	// 	if want[ix].TId != int(val.TId) {
-	// 		t.Errorf("row mismatch! (showing rows) want:\n%v\ngot:\n%v\n", want[ix], val)
-	// 		return
-	// 	}
-	// }
+	writeQ := goksql.NewQuery(ksql)
+	newRow := TestRow{}
+	newRow.TId = 10
+	newRow.IsValid = true
+	newRow.Name = "to jest z GO"
+	err = writeQ.InsertRow("testrows", newRow)
+	if err != nil {
+		t.Error(err)
+		return
+	}
 
 }
