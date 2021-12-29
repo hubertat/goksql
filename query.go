@@ -86,14 +86,11 @@ func (qry *Query) InsertRow(stream string, row interface{}) (err error) {
 		return
 	}
 
-	names, _, err := getQueryPartial(row)
+	_, names, err := getQueryPartial(row)
 	if err != nil {
 		err = errors.Wrapf(err, "get query partials failed (insert into stream: %s)", stream)
 		return
 	}
-
-	// timeField := time.Time{}
-	// timeType := reflect.TypeOf(timeField)
 
 	valString := ""
 	for ix, field := range reflect.VisibleFields(val.Type()) {
@@ -109,6 +106,8 @@ func (qry *Query) InsertRow(stream string, row interface{}) (err error) {
 			valString += fmt.Sprintf("%v", val.FieldByName(field.Name).Interface())
 		case reflect.String:
 			valString += fmt.Sprintf("'%v'", val.FieldByName(field.Name).Interface())
+		case reflect.TypeOf(time.Time{}).Kind():
+			valString += "'" + val.FieldByName(field.Name).Interface().(time.Time).Format(time.RFC3339) + "'"
 		default:
 			err = errors.Errorf("unsupported type %s", field.Type.Kind())
 			return
@@ -130,7 +129,7 @@ func (qry *Query) InsertRow(stream string, row interface{}) (err error) {
 	return
 }
 
-func getQueryPartial(modelPtr interface{}) (names string, types string, err error) {
+func getQueryPartial(modelPtr interface{}) (selectQuery string, insertQuery string, err error) {
 	val := reflect.ValueOf(modelPtr)
 
 	var structType reflect.Type
@@ -151,8 +150,8 @@ func getQueryPartial(modelPtr interface{}) (names string, types string, err erro
 	}
 
 	fieldMap := map[string]reflect.Type{}
-	fieldNames := []string{}
-	fieldTypes := []string{}
+	insertNames := []string{}
+	selectNames := []string{}
 
 	for _, field := range reflect.VisibleFields(structType) {
 		if field.IsExported() {
@@ -163,7 +162,17 @@ func getQueryPartial(modelPtr interface{}) (names string, types string, err erro
 				return
 			}
 			fieldMap[loName] = field.Type
-			fieldNames = append(fieldNames, loName)
+			switch field.Type.Kind() {
+			case reflect.Int, reflect.Int16, reflect.Int32, reflect.Int64, reflect.Float64, reflect.Float32, reflect.Bool, reflect.String:
+				selectNames = append(selectNames, loName)
+				insertNames = append(insertNames, loName)
+			case reflect.TypeOf(time.Time{}).Kind():
+				selectNames = append(selectNames, fmt.Sprintf("UNIX_TIMESTAMP(%s) as %s", loName, loName))
+				insertNames = append(insertNames, loName)
+			default:
+				err = errors.Errorf("unsupported type (kind): %s struct field", field.Type.Kind())
+				return
+			}
 		}
 	}
 
@@ -172,42 +181,8 @@ func getQueryPartial(modelPtr interface{}) (names string, types string, err erro
 		return
 	}
 
-	timeField := time.Time{}
-	timeType := reflect.TypeOf(timeField)
-
-	for _, name := range fieldNames {
-		t, exist := fieldMap[name]
-		if !exist {
-			err = errors.Errorf("field named %s missing in fieldMap", name)
-			return
-		}
-		switch t.Kind() {
-		case reflect.Bool:
-			fieldTypes = append(fieldTypes, "boolean")
-		case reflect.String:
-			fieldTypes = append(fieldTypes, "string")
-		case reflect.Int32:
-			fieldTypes = append(fieldTypes, "int")
-		case reflect.Int64:
-			fieldTypes = append(fieldTypes, "bigint")
-		case reflect.Float64:
-			fieldTypes = append(fieldTypes, "double")
-		case timeType.Kind():
-			fieldTypes = append(fieldTypes, "timestamp")
-		default:
-			err = errors.Errorf("unsupported field kind: %s", t.Name())
-			return
-		}
-	}
-
-	for ix, name := range fieldNames {
-		types += fmt.Sprintf("%s %s", name, strings.ToUpper(fieldTypes[ix]))
-		if ix+1 < len(fieldTypes) {
-			types += ", "
-		}
-	}
-
-	names = strings.Join(fieldNames, ", ")
+	selectQuery = strings.Join(selectNames, ", ")
+	insertQuery = strings.Join(insertNames, ", ")
 	return
 }
 
@@ -224,9 +199,6 @@ func (qry *Query) verifySchema(modelPtr interface{}) (fieldsOk bool, err error) 
 		err = errors.Errorf("verifyFieldsInSchema received pointer to non-struct type (%s)", structType.Kind())
 		return
 	}
-
-	timeField := time.Time{}
-	timeType := reflect.TypeOf(timeField)
 
 	for _, field := range reflect.VisibleFields(structType) {
 		schemaField, fieldPresent := qry.schema[strings.ToLower(field.Name)]
@@ -275,8 +247,8 @@ func (qry *Query) verifySchema(modelPtr interface{}) (fieldsOk bool, err error) 
 				err = errors.Errorf("field %s, kind %s mismatch type in schema (%s)", field.Name, field.Type.Kind(), schemaField.Type)
 				return
 			}
-		case timeType.Kind():
-			if strings.EqualFold(schemaField.Type, "timestamp") {
+		case reflect.TypeOf(time.Time{}).Kind():
+			if strings.EqualFold(schemaField.Type, "bigint") {
 				fieldsOk = true
 			} else {
 				fieldsOk = false
@@ -353,11 +325,18 @@ func fillResultIntoSlice(rows []*KsqlRow, targetSlice interface{}) error {
 					default:
 						return errors.Errorf("unsupported conversion, rowField kind is: %s, target field kind: %s", rowFieldVal.Kind(), field.Type.Kind())
 					}
-
 				case reflect.Float64:
 					switch rowFieldVal.Kind() {
 					case reflect.Float32, reflect.Float64:
 						reflect.Indirect(element).Field(ix).SetFloat(rowField.Interface().(float64))
+					default:
+						return errors.Errorf("unsupported conversion, rowField kind is: %s, target field kind: %s", rowFieldVal.Kind(), field.Type.Kind())
+					}
+				case reflect.TypeOf(time.Time{}).Kind():
+					switch rowFieldVal.Kind() {
+					case reflect.Float64:
+						t := time.UnixMilli(int64(rowField.Interface().(float64)))
+						reflect.Indirect(element).Field(ix).Set(reflect.ValueOf(t))
 					default:
 						return errors.Errorf("unsupported conversion, rowField kind is: %s, target field kind: %s", rowFieldVal.Kind(), field.Type.Kind())
 					}

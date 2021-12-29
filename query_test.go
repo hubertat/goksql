@@ -3,6 +3,7 @@ package goksql_test
 import (
 	"goksql"
 	"testing"
+	"time"
 )
 
 func TestLoadTable(t *testing.T) {
@@ -19,6 +20,7 @@ func TestLoadTable(t *testing.T) {
 		Name       string
 		Value      float64
 		OtherValue float64
+		CustomDate time.Time
 	}
 	result := []TestRow{}
 	query := goksql.NewQuery(ksql)
@@ -35,8 +37,8 @@ func TestLoadTable(t *testing.T) {
 	}
 
 	want := []TestRow{
-		{1, false, "longer name", 3.0, 1.1},
-		{2, false, "noname", 3.0, 22.2},
+		{1, false, "longer name", 3.0, 1.1, time.Now()},
+		{2, false, "noname", 3.0, 22.2, time.Now()},
 	}
 
 	for ix, val := range result {
@@ -54,10 +56,15 @@ func TestLoadTable(t *testing.T) {
 	newRow.TId = 10
 	newRow.IsValid = true
 	newRow.Name = "to jest z GO"
+	newRow.CustomDate = time.Now()
 	err = writeQ.InsertRow("testrows", newRow)
 	if err != nil {
 		t.Error(err)
 		return
 	}
+
+	newRow.TId = 11
+	newRow.CustomDate = time.Now().Add(-30 * time.Hour)
+	writeQ.InsertRow("testrows", newRow)
 
 }

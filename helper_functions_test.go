@@ -16,20 +16,20 @@ func TestQueryPartials(t *testing.T) {
 		When  time.Time
 	}
 
-	partialNames, partialWithTypes, err := getQueryPartial(&SomeModel{})
+	selectPartials, insertPartials, err := getQueryPartial(&SomeModel{})
 	if err != nil {
 		t.Error(err)
 		return
 	}
 
-	want := "name, ref, uref, value, yesno, when"
-	if !strings.EqualFold(want, partialNames) {
-		t.Errorf("got:\t%s\nwant:\t%s\n", partialNames, want)
+	want := "name, ref, uref, value, yesno, UNIX_TIMESTAMP(when) as when"
+	if !strings.EqualFold(want, selectPartials) {
+		t.Errorf("got:\t%s\nwant:\t%s\n", selectPartials, want)
 	}
 
-	want = "name STRING, ref BIGINT, uref INT, value DOUBLE, yesno BOOLEAN, when TIMESTAMP"
-	if !strings.EqualFold(want, partialWithTypes) {
-		t.Errorf("got:\t%s\nwant:\t%s\n", partialWithTypes, want)
+	want = "name, ref, uref, value, yesno, when"
+	if !strings.EqualFold(want, insertPartials) {
+		t.Errorf("got:\t%s\nwant:\t%s\n", insertPartials, want)
 	}
 
 	type IncorrectType struct {
